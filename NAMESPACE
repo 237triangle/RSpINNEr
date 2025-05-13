@@ -3,5 +3,8 @@
 export(ProxFsvd)
 export(ProxG)
 export(ProxH)
+export(minNormEstim)
 export(spinner)
 export(spinnerBoth)
+export(spinnerLasso)
+export(spinnerNuclear)

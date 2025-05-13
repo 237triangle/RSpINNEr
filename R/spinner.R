@@ -138,6 +138,252 @@ spinner <- function(y, X, AA, lambdaN, lambdaL, W = NULL) {
 }
 
 
+
+#' Spinner Nuclear Norm only, internal
+#'
+#' @param y
+#' @param SVDAx
+#' @param lambda_N
+#' @param solOptions
+#'
+#' @return
+#' @export
+#'
+#' @examples
+spinnerNuclear <- function(y, SVDAx, lambda_N, solOptions) {
+
+  # This function solves the optimization problem:
+  # argmin_B {  0.5 * sum_i (y_i - <A_i, B>)^2 + lambda_N || B ||_*  }
+
+  # Extract parameters
+  p0 <- nrow(SVDAx$U)
+  p <- (1 + sqrt(1 + 8 * p0)) / 2
+
+  # Solver options
+  deltaInitial <- solOptions$deltaInitial1
+  mu <- solOptions$mu
+  deltaInc <- solOptions$deltaInc
+  deltaDecr <- solOptions$deltaDecr
+  maxIters <- solOptions$maxIters
+  epsPri <- solOptions$epsPri
+  epsDual <- solOptions$epsDual
+
+  # SVD components
+  U <- SVDAx$U
+  Sdiag <- SVDAx$Sdiag
+  Vt <- SVDAx$Vt
+  idxs <- SVDAx$idxs
+
+  # Initial primal and dual matrix
+  Ck <- matrix(0, p, p)
+  Wk <- matrix(0, p, p)
+
+  # ADMM loop
+  delta <- deltaInitial
+  counterr <- 0
+  stop <- FALSE
+
+  while (!stop) {
+    # Solve using Proximal Operator functions
+    Bnew <- ProxFsvd(y, SVDAx, Ck, Wk, delta)
+    Cnew <- ProxG(Bnew, -Wk, delta, lambda_N)
+
+    Wk <- Wk + delta * (Cnew - Bnew)
+    rk <- Cnew - Bnew
+    sk <- Cnew - Ck
+
+    rknorm <- norm(rk, type = "F")
+    Bnorm <- norm(Bnew, type = "F")
+    rknormR <- rknorm / Bnorm
+    sknorm <- norm(sk, type = "F")
+    sknormR <- sknorm / norm(Ck, type = "F")
+
+    Ck <- Cnew
+    counterr <- counterr + 1
+
+    # Stopping criteria
+    if (counterr > 10) {
+      if (rknorm > mu * sknorm) {
+        delta <- deltaInc * delta
+      } else {
+        if (sknorm > mu * rknorm) {
+          delta <- delta / deltaDecr
+        }
+      }
+    }
+
+    if (rknormR < epsPri && sknormR < epsDual) {
+      stop <- TRUE
+    }
+
+    if (counterr > maxIters) {
+      stop <- TRUE
+    }
+
+    if (Bnorm < 1e-16) {
+      stop <- TRUE
+      Bnew <- matrix(0, p, p)
+      Cnew <- matrix(0, p, p)
+    }
+  }
+
+  # Optimal value
+  ClastVec <- as.vector(Cnew)
+  ClastVecU <- ClastVec[idxs]
+  MClast <- t(U) %*% ClastVecU * Sdiag
+  optVal <- 0.5 * norm(y - Vt %*% MClast, type = "F")^2 + lambda_N * sum(svd(Cnew)$d)
+
+  # Output list
+  out <- list(
+    optVal = optVal,
+    count = counterr,
+    delta = delta,
+    Blast = Bnew,
+    Clast = Cnew,
+    B = Cnew
+  )
+
+  return(out)
+}
+
+
+
+#' Spinner Lasso only, internal
+#'
+#' @param y
+#' @param SVDAx
+#' @param lambdaL
+#' @param WGTs
+#' @param solOptions
+#'
+#' @return
+#' @export
+#'
+#' @examples
+spinnerLasso <- function(y, SVDAx, lambdaL, WGTs, solOptions) {
+  # Extract problem dimensions
+  p0 <- nrow(SVDAx$U)
+  p <- (1 + sqrt(1 + 8 * p0)) / 2
+
+  ## Solver options
+  delta <- solOptions$deltaInitial2
+  mu <- solOptions$mu
+  deltaInc <- solOptions$deltaInc
+  deltaDecr <- solOptions$deltaDecr
+  maxIters <- solOptions$maxIters
+  epsPri <- solOptions$epsPri
+  epsDual <- solOptions$epsDual
+
+  ## SVD components
+  U <- SVDAx$U
+  Sdiag <- SVDAx$Sdiag
+  Vt <- SVDAx$Vt
+  idxs <- SVDAx$idxs
+
+  ## Initialization
+  Dk <- matrix(0, p, p)
+  Wk <- matrix(0, p, p)
+
+  ## ADMM loop
+  counter <- 0
+  stop <- FALSE
+
+  while (!stop) {
+    Bnew <- ProxFsvd(y, SVDAx, Dk, Wk, delta)
+    Dnew <- ProxH_lasso(Bnew, delta, Wk, lambdaL, WGTs)
+    Wk <- Wk + delta * (Dnew - Bnew)
+
+    rk <- Dnew - Bnew
+    sk <- Dnew - Dk
+    rknorm <- norm(rk, type = "F")
+    Bnorm <- norm(Bnew, type = "F")
+    rknormR <- rknorm / Bnorm
+    sknorm <- norm(sk, type = "F")
+    sknormR <- sknorm / norm(Dk, type = "F")
+
+    Dk <- Dnew
+    counter <- counter + 1
+
+    ## Stopping criteria
+    if (counter %% 10 == 0) {
+      if (rknorm > mu * sknorm) {
+        delta <- delta * deltaInc
+      } else if (sknorm > mu * rknorm) {
+        delta <- delta / deltaDecr
+      }
+    }
+
+    if (rknormR < epsPri && sknormR < epsDual) {
+      stop <- TRUE
+    }
+    if (counter > maxIters) {
+      stop <- TRUE
+    }
+    if (Bnorm < 1e-16) {
+      stop <- TRUE
+      Bnew <- matrix(0, p, p)
+      Dnew <- matrix(0, p, p)
+    }
+  }
+
+  ## Compute optimal value
+  DlastVec <- as.vector(Dnew)
+  DlastVecU <- DlastVec[idxs]
+  MDlast <- crossprod(U, DlastVecU) * Sdiag
+  residual <- y - crossprod(Vt, MDlast)
+  optVal <- 0.5 * sum(residual^2) + lambdaL * sum(abs(Dnew))
+
+  ## Output
+  out <- list(
+    optVal = optVal,
+    count = counter,
+    delta = delta,
+    Blast = Bnew,
+    Dlast = Dnew,
+    B = Dnew
+  )
+
+  return(out)
+}
+
+
+
+
+#' Spinner without either penalty, internal
+#'
+#' @param y
+#' @param SVDAx
+#'
+#' @return
+#' @export
+#'
+#' @examples
+minNormEstim <- function(y, SVDAx) {
+  ## Problem size
+  p0 <- nrow(SVDAx$U)
+  p <- (1 + sqrt(1 + 8 * p0)) / 2
+
+  ## Extract SVD components
+  U <- SVDAx$U
+  Sdiag <- SVDAx$Sdiag
+  Vt <- SVDAx$Vt
+  idxs <- SVDAx$idxs
+
+  ## Estimate
+  Vty <- (Vt %*% y) / Sdiag
+  Bvec <- U %*% Vty
+
+  Bestim <- numeric(p^2)
+  Bestim[idxs] <- Bvec
+  Bestim <- matrix(Bestim, nrow = p, ncol = p)
+  Bestim <- Bestim + t(Bestim)
+
+  ## Output
+  out <- list(B = Bestim)
+  return(out)
+}
+
+
 #' SpINNEr both, internal
 #'
 #' @param y
