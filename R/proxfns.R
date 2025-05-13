@@ -107,3 +107,22 @@ ProxH <- function(B, C, delta1, delta2, W1, W2, lambda_L, WGTs) {
   return(Dnew)
 }
 
+
+
+#' Prox H Lasso-specific
+#'
+#' @param B
+#' @param delta
+#' @param W
+#' @param lambdaL
+#' @param WGTs
+#'
+#' @return
+#' @export
+#'
+#' @examples
+ProxH_lasso <- function(B, delta, W, lambdaL, WGTs) {
+  Bdelta <- B - W / delta
+  Dnew <- sign(Bdelta) * pmax(abs(Bdelta) - WGTs * lambdaL / delta, 0)
+  return(Dnew)
+}

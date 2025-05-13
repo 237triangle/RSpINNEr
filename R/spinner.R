@@ -139,6 +139,176 @@ spinner <- function(y, X, AA, lambdaN, lambdaL, W = NULL) {
 
 
 
+
+
+#' Spinner with cross-validation
+#'
+#' @param y
+#' @param X
+#' @param AA
+#' @param ...
+#'
+#' @return
+#' @export
+#'
+#' @examples
+spinnerCV <- function(y, X, AA, ...) {
+  library(abind)    # for array manipulation
+  library(parallel) # for parallel computing if needed
+
+  args <- list(...)
+
+  ## --- Tensor shape handling ---
+  dims <- dim(AA)
+  p1 <- dims[1]
+  p2 <- dims[2]
+  p3 <- if (length(dims) == 3) dims[3] else 1
+
+  if (p3 == 1) {
+    if (p2 %% p1 != 0) {
+      stop("Expected AA to be 3D array with square matrix slices.")
+    } else {
+      AA <- array(AA, dim = c(p1, p1, p2 / p1))
+    }
+  }
+
+  n <- length(y)
+
+  ## --- Optional parameters ---
+  UseParallel   <- ifelse("UseParallel" %in% names(args), args$UseParallel, FALSE)
+  displayStatus <- ifelse("displayStatus" %in% names(args), args$displayStatus, TRUE)
+  W             <- if ("W" %in% names(args)) args$W else matrix(1, p1, p1) - diag(p1)
+  gridLengthN   <- ifelse("gridLengthN" %in% names(args), args$gridLengthN, 15)
+  gridLengthL   <- ifelse("gridLengthL" %in% names(args), args$gridLengthL, 15)
+  kfolds        <- ifelse("kfolds" %in% names(args), args$kfolds, 5)
+
+  ## --- Lambda search parameters ---
+  initLambda <- 1
+  zeroSearchRatio <- 100
+  maxLambAcc <- 1e-2
+
+  ## --- Cross-validation setup ---
+  set.seed(0)
+  group_ids <- sample(rep(1:kfolds, length.out = n))
+
+  ## --- Find maximal lambdaL giving zero B ---
+  clambdaL <- initLambda
+  ValsLambL <- numeric()
+  repeat {
+    out <- spinner(y, X, AA, 0, clambdaL, W)
+    if (sqrt(sum((W * out$B)^2)) < 1e-16) break
+    ValsLambL <- c(ValsLambL, clambdaL)
+    clambdaL <- zeroSearchRatio * clambdaL
+  }
+  lamL1 <- if (length(ValsLambL) == 1) 0 else tail(ValsLambL, 2)[1]
+  lamL2 <- tail(ValsLambL, 1)
+
+  # Refine lambdaL range
+  repeat {
+    mid <- (lamL1 + lamL2) / 2
+    out <- spinner(y, X, AA, 0, mid, W)
+    if (norm(out$B, type = "F") < 1e-16) lamL2 <- mid else lamL1 <- mid
+    if ((lamL2 - lamL1) / lamL2 < maxLambAcc) break
+  }
+
+  ## --- Find maximal lambdaN giving zero B ---
+  clambdaN <- initLambda
+  ValsLambN <- numeric()
+  repeat {
+    out <- spinner(y, X, AA, clambdaN, 0, W)
+    if (norm(out$B, type = "F") < 1e-16) break
+    ValsLambN <- c(ValsLambN, clambdaN)
+    clambdaN <- zeroSearchRatio * clambdaN
+  }
+  lamN1 <- if (length(ValsLambN) == 1) 0 else tail(ValsLambN, 2)[1]
+  lamN2 <- tail(ValsLambN, 1)
+
+  # Refine lambdaN range
+  repeat {
+    mid <- (lamN1 + lamN2) / 2
+    out <- spinner(y, X, AA, mid, 0, W)
+    if (norm(out$B, type = "F") < 1e-16) lamN2 <- mid else lamN1 <- mid
+    if ((lamN2 - lamN1) / lamN2 < maxLambAcc) break
+  }
+
+  ## --- Final lambda grids ---
+  k <- 0.75
+  seqq <- (1:(gridLengthL - 1)) / (gridLengthL - 1)
+  LambsLgrid <- c(0, exp((log(lamL2 + 1)^(1/k) * seqq)^k) - 1)
+  LambsNgrid <- c(0, exp((log(lamN2 + 1)^(1/k) * seqq)^k) - 1)
+
+  ## --- Cross-validation ---
+  logliksCV <- matrix(0, nrow = gridLengthN, ncol = gridLengthL)
+
+  cv_fun <- function(ii, jj) {
+    clambdaN <- LambsNgrid[ii]
+    clambdaL <- LambsLgrid[jj]
+    normResCV <- numeric(kfolds)
+
+    for (gg in 1:kfolds) {
+      test_idx <- which(group_ids == gg)
+      train_idx <- setdiff(1:n, test_idx)
+
+      AA_train <- AA[, , train_idx, drop = FALSE]
+      AA_test  <- AA[, , test_idx, drop = FALSE]
+      y_train <- y[train_idx]
+      y_test  <- y[test_idx]
+      X_train <- if (!is.null(X)) X[train_idx, , drop = FALSE] else NULL
+      X_test  <- if (!is.null(X)) X[test_idx, , drop = FALSE] else matrix(0, nrow = length(test_idx), ncol = 1)
+
+      out_cv <- spinner(y_train, X_train, AA_train, clambdaN, clambdaL, W)
+      AA_test_mat <- do.call(rbind, lapply(1:dim(AA_test)[3], function(i) as.vector(AA_test[,,i])))
+
+      y_pred <- AA_test_mat %*% as.vector(out_cv$B) + X_test %*% out_cv$beta
+      normResCV[gg] <- 0.5 * sum((y_test - y_pred)^2)
+    }
+    sum(normResCV) / n
+  }
+
+  if (UseParallel) {
+    cl <- makeCluster(detectCores())
+    clusterExport(cl, varlist = c("spinner", "AA", "X", "y", "W", "LambsNgrid", "LambsLgrid", "group_ids", "kfolds", "n"), envir = environment())
+    logliks_list <- parLapply(cl, 1:gridLengthN, function(ii) {
+      sapply(1:gridLengthL, function(jj) cv_fun(ii, jj))
+    })
+    stopCluster(cl)
+    logliksCV <- do.call(rbind, logliks_list)
+  } else {
+    for (ii in 1:gridLengthN) {
+      for (jj in 1:gridLengthL) {
+        logliksCV[ii, jj] <- cv_fun(ii, jj)
+        if (displayStatus) {
+          message(sprintf("Finished: lambdaN[%d], lambdaL[%d]", ii, jj))
+        }
+      }
+    }
+  }
+
+  ## --- Find optimal lambdas ---
+  min_val <- min(logliksCV)
+  idx <- which(logliksCV == min_val, arr.ind = TRUE)
+  bestLambdaN <- LambsNgrid[idx[1, 1]]
+  bestLambdaL <- LambsLgrid[idx[1, 2]]
+
+  ## --- Final model fit ---
+  outFinal <- spinner(y, X, AA, bestLambdaN, bestLambdaL, W)
+
+  ## --- Output ---
+  list(
+    LambsLgrid = LambsLgrid,
+    LambsNgrid = LambsNgrid,
+    logliksCV = logliksCV,
+    B = outFinal$B,
+    beta = outFinal$beta,
+    bestLambdaN = bestLambdaN,
+    bestLambdaL = bestLambdaL
+  )
+}
+
+
+
+
+
 #' Spinner Nuclear Norm only, internal
 #'
 #' @param y
